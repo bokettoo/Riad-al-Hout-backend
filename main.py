@@ -288,3 +288,14 @@ app.add_middleware(
     allow_methods=["*"],    # Allows all methods (GET, POST, PUT, DELETE, OPTIONS)
     allow_headers=["*"],    # Allows all headers (including Authorization)
 )
+
+if __name__ == "__main__":
+    import uvicorn
+    # Ensure dotenv.load_dotenv() is called early in main.py (should already be at the top)
+    uvicorn.run(
+        "main:app",
+        host="127.0.0.1",
+        port=12447,
+        reload=True,
+        log_level="info"
+    )
