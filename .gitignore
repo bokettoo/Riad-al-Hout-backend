@@ -6,16 +6,16 @@ __pycache__/
 
 # Environment variables
 .env
-.venv/  # Virtual environment directory (common name)
-venv/   # Another common virtual environment name
+.venv/
+venv/
 
 # Editor/IDE specific files
-.vscode/        # VS Code settings (if you don't want to share)
-.idea/          # IntelliJ IDEA / PyCharm
-*.swp           # Vim swap files
-*~              # Emacs backup files
+.vscode/
+.idea/
+*.swp
+*~
 
-# Database files (if using a local SQLite for testing, but you're on Postgres)
+# Database files
 *.db
 *.sqlite
 *.sqlite3
@@ -24,11 +24,8 @@ venv/   # Another common virtual environment name
 *.log
 
 # FastAPI/Uvicorn specific
-# If Uvicorn creates any specific temporary files, add them here.
-# 'uvicorn' in your tree appears to be a file, not a directory.
-# If it's a generated executable or temporary file, include it.
-# If it's a configuration file you want to track, remove this.
 uvicorn
 
 # Vercel specific
-.vercel/ # Vercel build output and cache
+.vercel/ # Vercel build output and cache directory
+.vercel
