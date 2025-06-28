@@ -1,6 +1,6 @@
 import os
-from datetime import date
-from typing import List, Optional, Literal
+from datetime import date, datetime
+from typing import List, Optional, Literal, Dict
 from uuid import UUID
 
 from fastapi import FastAPI, Depends, HTTPException, status, Response
@@ -12,7 +12,9 @@ from database import get_db
 from models import (
     MenuItemResponse, MenuItemCreate, MenuItemUpdate,
     ReservationResponse, ReservationCreate, ReservationUpdate,
-    UserResponse, Token, ErrorResponse, UserCreate # <--- ENSURE Token is now here, and UserCreate too!
+    UserResponse, Token, ErrorResponse, UserCreate, # <--- ENSURE Token is now here, and UserCreate too!
+    OrderItemCreate, OrderItemResponse,
+    OrderCreate, OrderResponse,RevenueRecordResponse
 )
 from auth import authenticate_user, create_access_token, get_current_admin_user, get_password_hash, get_current_user
 from dotenv import load_dotenv
@@ -273,12 +275,365 @@ async def delete_reservation(reservation_id: UUID, db: Session = Depends(get_db)
         db.rollback()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
+@app.post("/api/orders", response_model=OrderResponse, status_code=status.HTTP_201_CREATED, summary="Create a new order for a reservation (Admin only)")
+async def create_order(
+    order_create: OrderCreate,
+    db: Session = Depends(get_db),
+    current_admin: UserResponse = Depends(get_current_admin_user)
+):
+    # 1. Check if reservation exists and is completed
+    reservation_query = text("SELECT status FROM reservations WHERE id = :reservation_id")
+    reservation_status = db.execute(reservation_query, {"reservation_id": order_create.reservation_id}).scalar_one_or_none()
+
+    if not reservation_status:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reservation not found")
+    if reservation_status != 'completed': # Ensure reservation is 'completed'
+         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Order can only be created for completed reservations. Current status: {reservation_status}")
+
+    # 2. Check if an order already exists for this reservation (UNIQUE constraint)
+    existing_order_query = text("SELECT id FROM orders WHERE reservation_id = :reservation_id")
+    existing_order_id = db.execute(existing_order_query, {"reservation_id": order_create.reservation_id}).scalar_one_or_none()
+    if existing_order_id:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="An order already exists for this reservation.")
+
+    total_amount = 0.0
+    order_items_to_insert = []
+    inserted_order_items_response = []
+
+    try:
+        # 3. Create the main Order entry first
+        insert_order_query = text(
+            "INSERT INTO orders (reservation_id) VALUES (:reservation_id) "
+            "RETURNING id, total_amount, order_date, created_at, updated_at"
+        )
+        order_result = db.execute(insert_order_query, {"reservation_id": order_create.reservation_id}).fetchone()
+        db.commit() # Commit the order creation before adding items
+
+        if not order_result:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create order.")
+
+        new_order_id = order_result[0]
+
+        # 4. Process each OrderItem
+        for item_data in order_create.items:
+            # Fetch menu item price
+            menu_item_query = text("SELECT price FROM menu_items WHERE id = :menu_item_id")
+            menu_item_price = db.execute(menu_item_query, {"menu_item_id": item_data.menu_item_id}).scalar_one_or_none()
+
+            if menu_item_price is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Menu item with ID {item_data.menu_item_id} not found.")
+
+            subtotal = float(menu_item_price) * item_data.quantity
+            total_amount += subtotal
+
+            order_items_to_insert.append({
+                "order_id": new_order_id,
+                "menu_item_id": item_data.menu_item_id,
+                "quantity": item_data.quantity,
+                "price_at_order": float(menu_item_price),
+                "subtotal": subtotal
+            })
+
+        # 5. Insert OrderItems in a single batch (or individually if preferred)
+        if order_items_to_insert:
+            insert_order_items_query = text(
+                "INSERT INTO order_items (order_id, menu_item_id, quantity, price_at_order, subtotal) VALUES "
+                + ", ".join([f"(:order_id_{i}, :menu_item_id_{i}, :quantity_{i}, :price_at_order_{i}, :subtotal_{i})" for i in range(len(order_items_to_insert))])
+                + " RETURNING id, order_id, menu_item_id, quantity, price_at_order, subtotal, created_at, updated_at"
+            )
+            # Prepare parameters for batch insert
+            params = {}
+            for i, item in enumerate(order_items_to_insert):
+                for key, value in item.items():
+                    params[f"{key}_{i}"] = value
+
+            order_items_results = db.execute(insert_order_items_query, params).fetchall()
+            inserted_order_items_response = [OrderItemResponse(**item._asdict()) for item in order_items_results]
+
+        # 6. Update the Order's total_amount
+        update_order_total_query = text(
+            "UPDATE orders SET total_amount = :total_amount WHERE id = :order_id "
+            "RETURNING id, total_amount, order_date, created_at, updated_at"
+        )
+        updated_order_result = db.execute(update_order_total_query, {"total_amount": total_amount, "order_id": new_order_id}).fetchone()
+        db.commit()
+
+        return OrderResponse(
+            id=updated_order_result[0],
+            reservation_id=order_create.reservation_id,
+            total_amount=updated_order_result[1],
+            order_date=updated_order_result[2],
+            created_at=updated_order_result[3],
+            updated_at=updated_order_result[4],
+            items=inserted_order_items_response
+        )
+
+    except HTTPException as e: # Catch HTTPExceptions raised within the try block
+        db.rollback()
+        raise e
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {str(e)}")
+
+@app.get("/api/orders/{order_id}", response_model=OrderResponse, summary="Get an order by ID (Admin only)")
+async def get_order(
+    order_id: UUID,
+    db: Session = Depends(get_db),
+    current_admin: UserResponse = Depends(get_current_admin_user)
+):
+    order_query = text(
+        "SELECT id, reservation_id, total_amount, order_date, created_at, updated_at FROM orders WHERE id = :order_id"
+    )
+    order_result = db.execute(order_query, {"order_id": order_id}).fetchone()
+    if not order_result:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+
+    order_items_query = text(
+        "SELECT id, order_id, menu_item_id, quantity, price_at_order, subtotal, created_at, updated_at FROM order_items WHERE order_id = :order_id"
+    )
+    order_items_results = db.execute(order_items_query, {"order_id": order_id}).fetchall()
+    items_response = [OrderItemResponse(**item._asdict()) for item in order_items_results]
+
+    return OrderResponse(
+        id=order_result[0],
+        reservation_id=order_result[1],
+        total_amount=order_result[2],
+        order_date=order_result[3],
+        created_at=order_result[4],
+        updated_at=order_result[5],
+        items=items_response
+    )
+# main.py (Add this new API route below your existing order endpoints)
+
+@app.delete("/api/orders/{order_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Delete an order by ID (Admin only)")
+async def delete_order(
+    order_id: UUID,
+    db: Session = Depends(get_db),
+    current_admin: UserResponse = Depends(get_current_admin_user)
+):
+    delete_query = text("DELETE FROM orders WHERE id = :id RETURNING id")
+    try:
+        result = db.execute(delete_query, {"id": order_id}).fetchone()
+        db.commit()
+        if not result:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+        return # 204 No Content response
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+@app.get("/api/reservations/{reservation_id}/order", response_model=Optional[OrderResponse], summary="Get order linked to a reservation (Admin only)")
+async def get_order_by_reservation_id(
+    reservation_id: UUID,
+    db: Session = Depends(get_db),
+    current_admin: UserResponse = Depends(get_current_admin_user)
+):
+    order_query = text(
+        "SELECT id, reservation_id, total_amount, order_date, created_at, updated_at FROM orders WHERE reservation_id = :reservation_id"
+    )
+    order_result = db.execute(order_query, {"reservation_id": reservation_id}).fetchone()
+    if not order_result:
+        return None # No order found for this reservation
+
+    order_items_query = text(
+        "SELECT id, order_id, menu_item_id, quantity, price_at_order, subtotal, created_at, updated_at FROM order_items WHERE order_id = :order_id"
+    )
+    order_items_results = db.execute(order_items_query, {"order_id": order_result[0]}).fetchall()
+    items_response = [OrderItemResponse(**item._asdict()) for item in order_items_results]
+
+    return OrderResponse(
+        id=order_result[0],
+        reservation_id=order_result[1],
+        total_amount=order_result[2],
+        order_date=order_result[3],
+        created_at=order_result[4],
+        updated_at=order_result[5],
+        items=items_response
+    )
+
+@app.put("/api/orders/{order_id}", response_model=OrderResponse, summary="Update an existing order (Admin only)")
+async def update_order(
+    order_id: UUID,
+    order_update: OrderCreate,
+    db: Session = Depends(get_db),
+    current_admin: UserResponse = Depends(get_current_admin_user)
+):
+    # 1. Check if order exists and matches reservation_id
+    order_query = text("SELECT id, reservation_id FROM orders WHERE id = :order_id")
+    order_result = db.execute(order_query, {"order_id": order_id}).fetchone()
+    if not order_result:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+    if str(order_result[1]) != str(order_update.reservation_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Reservation ID mismatch for this order.")
+
+    try:
+        # 2. Delete all existing order_items for this order
+        delete_items_query = text("DELETE FROM order_items WHERE order_id = :order_id")
+        db.execute(delete_items_query, {"order_id": order_id})
+        db.commit()
+
+        # 3. Insert new order_items
+        total_amount = 0.0
+        order_items_to_insert = []
+        for item_data in order_update.items:
+            # Fetch menu item price
+            menu_item_query = text("SELECT price FROM menu_items WHERE id = :menu_item_id")
+            menu_item_price = db.execute(menu_item_query, {"menu_item_id": item_data.menu_item_id}).scalar_one_or_none()
+            if menu_item_price is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Menu item with ID {item_data.menu_item_id} not found.")
+            subtotal = float(menu_item_price) * item_data.quantity
+            total_amount += subtotal
+            order_items_to_insert.append({
+                "order_id": order_id,
+                "menu_item_id": item_data.menu_item_id,
+                "quantity": item_data.quantity,
+                "price_at_order": float(menu_item_price),
+                "subtotal": subtotal
+            })
+        # Insert new order_items in batch
+        if order_items_to_insert:
+            insert_order_items_query = text(
+                "INSERT INTO order_items (order_id, menu_item_id, quantity, price_at_order, subtotal) VALUES "
+                + ", ".join([f"(:order_id_{i}, :menu_item_id_{i}, :quantity_{i}, :price_at_order_{i}, :subtotal_{i})" for i in range(len(order_items_to_insert))])
+                + " RETURNING id, order_id, menu_item_id, quantity, price_at_order, subtotal, created_at, updated_at"
+            )
+            params = {}
+            for i, item in enumerate(order_items_to_insert):
+                for key, value in item.items():
+                    params[f"{key}_{i}"] = value
+            order_items_results = db.execute(insert_order_items_query, params).fetchall()
+            inserted_order_items_response = [OrderItemResponse(**item._asdict()) for item in order_items_results]
+        else:
+            inserted_order_items_response = []
+        # 4. Update order's total_amount
+        update_order_total_query = text(
+            "UPDATE orders SET total_amount = :total_amount, updated_at = NOW() WHERE id = :order_id "
+            "RETURNING id, reservation_id, total_amount, order_date, created_at, updated_at"
+        )
+        updated_order_result = db.execute(update_order_total_query, {"total_amount": total_amount, "order_id": order_id}).fetchone()
+        db.commit()
+        return OrderResponse(
+            id=updated_order_result[0],
+            reservation_id=updated_order_result[1],
+            total_amount=updated_order_result[2],
+            order_date=updated_order_result[3],
+            created_at=updated_order_result[4],
+            updated_at=updated_order_result[5],
+            items=inserted_order_items_response
+        )
+    except HTTPException as e:
+        db.rollback()
+        raise e
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {str(e)}")
+
+@app.get("/api/revenue", response_model=List[RevenueRecordResponse], summary="Get all revenue records (Admin only)")
+async def get_all_revenue_records(
+    db: Session = Depends(get_db),
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    current_admin: UserResponse = Depends(get_current_admin_user)
+):
+    query_str = "SELECT id, order_id, reservation_id, amount, record_date, created_at, updated_at FROM revenue_records"
+    where_clauses = []
+    params = {}
+
+    if start_date:
+        where_clauses.append("CAST(record_date AS DATE) >= :start_date")
+        params["start_date"] = start_date
+
+    if end_date:
+        where_clauses.append("CAST(record_date AS DATE) <= :end_date")
+        params["end_date"] = end_date
+
+    if where_clauses:
+        query_str += " WHERE " + " AND ".join(where_clauses)
+
+    query_str += " ORDER BY record_date DESC, created_at DESC" # Order by most recent first
+
+    result = db.execute(text(query_str), params).fetchall()
+    return [RevenueRecordResponse(**item._asdict()) for item in result]
+
+@app.get("/api/revenue/summary", response_model=Dict[str, float], summary="Get total revenue summary (Admin only)")
+async def get_total_revenue_summary(
+    db: Session = Depends(get_db),
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    current_admin: UserResponse = Depends(get_current_admin_user)
+):
+    query_str = "SELECT SUM(amount) FROM revenue_records"
+    where_clauses = []
+    params = {}
+
+    if start_date:
+        where_clauses.append("CAST(record_date AS DATE) >= :start_date")
+        params["start_date"] = start_date
+
+    if end_date:
+        where_clauses.append("CAST(record_date AS DATE) <= :end_date")
+        params["end_date"] = end_date
+
+    if where_clauses:
+        query_str += " WHERE " + " AND ".join(where_clauses)
+
+    total_revenue = db.execute(text(query_str), params).scalar_one_or_none()
+    return {"total_revenue": float(total_revenue) if total_revenue is not None else 0.00}
+
+@app.get("/api/stats/most-sold-items", summary="Get most sold menu items (Admin only)")
+async def get_most_sold_items(
+    db: Session = Depends(get_db),
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    current_admin: UserResponse = Depends(get_current_admin_user)
+):
+    # Join order_items and menu_items, group by menu_item_id, sum quantity
+    query = """
+        SELECT
+            oi.menu_item_id,
+            mi.name,
+            mi.category,
+            mi.price,
+            SUM(oi.quantity) AS total_quantity
+        FROM order_items oi
+        JOIN menu_items mi ON oi.menu_item_id = mi.id
+        JOIN orders o ON oi.order_id = o.id
+        JOIN reservations r ON o.reservation_id = r.id
+        {where_clause}
+        GROUP BY oi.menu_item_id, mi.name, mi.category, mi.price
+        ORDER BY total_quantity DESC, mi.name ASC
+        LIMIT 20
+    """
+    where_clauses = []
+    params = {}
+    if start_date:
+        where_clauses.append("r.reservation_date >= :start_date")
+        params["start_date"] = start_date
+    if end_date:
+        where_clauses.append("r.reservation_date <= :end_date")
+        params["end_date"] = end_date
+    where_clause = ""
+    if where_clauses:
+        where_clause = "WHERE " + " AND ".join(where_clauses)
+    final_query = query.format(where_clause=where_clause)
+    result = db.execute(text(final_query), params).fetchall()
+    return [
+        {
+            "menu_item_id": str(row.menu_item_id),
+            "name": row.name,
+            "category": row.category,
+            "price": float(row.price),
+            "total_quantity": int(row.total_quantity)
+        }
+        for row in result
+    ]
+
 # --- CORS Middleware (Crucial for Frontend Communication) ---
 from fastapi.middleware.cors import CORSMiddleware
 
 origins = [
     "http://localhost:5173",  # Your React dev server
-    # Add your Vercel frontend URL here when deployed, e.g., "https://your-frontend-app.vercel.app"
+    "https://riad-al-hout.vercel.app/" #vercel 
 ]
 
 app.add_middleware(

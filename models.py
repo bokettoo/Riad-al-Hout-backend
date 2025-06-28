@@ -1,5 +1,5 @@
 from datetime import date, time, datetime
-from typing import Optional, Literal
+from typing import Optional, Literal, List
 from uuid import UUID
 from pydantic import BaseModel, Field
 
@@ -95,3 +95,54 @@ class UserInDB(UserResponse):
 class ErrorResponse(BaseModel):
     detail: str
     code: Optional[str] = None
+
+class OrderItemBase(BaseModel):
+    order_id: UUID
+    menu_item_id: UUID
+    quantity: int = Field(..., gt=0) # Greater than 0
+
+class OrderItemCreate(BaseModel): # For client to send when creating a new order item
+    menu_item_id: UUID
+    quantity: int = Field(..., gt=0)
+
+class OrderItemResponse(OrderItemBase):
+    id: UUID
+    price_at_order: float # Renamed from NUMERIC to float for Pydantic
+    subtotal: float
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+# --- New Order Models ---
+class OrderBase(BaseModel):
+    reservation_id: UUID
+    total_amount: float = Field(0.00, ge=0) # Renamed from NUMERIC to float for Pydantic
+
+class OrderCreate(BaseModel):
+    reservation_id: UUID
+    items: List[OrderItemCreate] # A list of items in this order
+
+class OrderResponse(OrderBase):
+    id: UUID
+    order_date: datetime # This comes from the DB
+    created_at: datetime
+    updated_at: datetime
+    items: List[OrderItemResponse] = [] # Include ordered items in response
+
+    class Config:
+        from_attributes = True
+class RevenueRecordBase(BaseModel):
+    order_id: UUID
+    reservation_id: UUID
+    amount: float = Field(..., ge=0)
+
+class RevenueRecordResponse(RevenueRecordBase):
+    id: UUID
+    record_date: datetime
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
